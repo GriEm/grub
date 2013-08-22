@@ -1,129 +1,185 @@
-require 'rubygems'
 require 'mechanize'
 require 'thread'
+require 'benchmark'
 
-class ImageLoader	
+class ImageLoader
 
-    DEFAULT_THREAD_CNT = 2
-
-    attr_accessor   :URL, :Folder
-    attr_accessor   :Proxy, :User, :Password
-    attr_accessor   :ThreadCnt
-    attr_reader     :ImgList
-
-    def initialize(&block)
-        @ImgList    = []
-        @ThreadCnt  = DEFAULT_THREAD_CNT
-
-        instance_eval(&block)
-
-        @URL    = @URL.gsub(" ","") if @URL != nil
-        @Proxy  = @Proxy.gsub(" ","") if @Proxy != nil
-
-        @agent = Mechanize.new do |a|
-            if @Proxy
-                a.set_proxy(
-                                @Proxy[%r{.*:}].sub(":",""),
-                                @Proxy[%r{[0-9]*$}],
-                                @User,@Password
-                ) rescue raise ArgumentError, "Proxy fail"
-            end
-        end
+    class FolderError < StandardError
     end
 
-    def load(url = nil, folder = nil)
-        begin		
-            setURL(url)
-            setFolder(folder)
+    class SaveFileError < StandardError
+    end
 
-            startStat
-            page = @agent.get(@URL)
-            queueLoad(page)
-            stopStat
-        rescue
-            puts "Load fail"
-        end
+    DEFAULT_THREAD_CNT  = 2
+    DEFAULT_FOLDER      = 'images'
+
+    attr_reader     :url, :folder
+    attr_accessor   :thread_cnt
+    attr_reader     :img_cnt
+
+    def initialize(proxy = nil, user = nil, psw = nil)
+
+        @url        = ""
+        @folder     = DEFAULT_FOLDER
+        @thread_cnt = DEFAULT_THREAD_CNT
+        @img_cnt    = 0
+
+        @http   = HTTPPageSocket.new(proxy, user, psw)
+        @parser = HTTPPageParser.new
+
+    end
+
+    def load(url, folder = nil)
+
+        @url        = url
+        @folder     = (folder.nil? || folder.empty?) ? DEFAULT_FOLDER : folder
+        @img_cnt    = 0
+
+        open_folder(@folder)
+
+        @open_time = Benchmark.measure { @page = @http.open(@url) }
+        @pars_time = Benchmark.measure { @queue_images = @parser.get_images(@page) }
+        @load_time = Benchmark.measure { thread_load(@queue_images) }
+
+        print_log
+
     end
 
     private
 
-    def startStat
-        @StartTime = Time.new
+    def print_log
+        puts
+        puts "URL:".ljust(15)           + @url
+        puts "Folder:".ljust(15)        + @folder
+        puts "Load images:".ljust(15)   + @img_cnt.to_s
+        puts
+        puts "Time execute (sec)"
+        puts
+        puts " "*7 + Benchmark::Tms::CAPTION
+        puts "open".ljust(7) + @open_time.to_s
+        puts "parsing".ljust(7) + @pars_time.to_s
+        puts "load".ljust(7) + @load_time.to_s
     end
 
-    def stopStat
-        @StopTime = Time.new
-
-        STDOUT.puts "\nLoad images from <#{@URL}> to <#{@Folder}>"
-        STDOUT.puts "Count load images:   #{@ImgList.size}"
-        STDOUT.puts "Load time(sec):      #{@StopTime - @StartTime}"
-    end
-
-    # если url == nil, то используется значение, указанное
-    # при создании экземляра класса
-
-    def setURL(url)
-        @URL = url.gsub(" ","") if url != nil
-        raise(ArgumentError,"URL fail") if @URL == nil or @URL.empty?
-    end
-
-    # если folder == nil, то все картинки сохраняются в
-    # папку images, расположенную там же, где и grub.rb
-
-    def setFolder(folder)
-        @Folder = folder
-        @Folder = "images" if folder == nil
-
+    def open_folder(folder)
         begin
-            unless File::exist?(@Folder)
-                Dir.mkdir(@Folder)
-            end
+            Dir.mkdir(folder) unless File::exist?(folder)
         rescue
-            raise RuntimeError, "Folder fail"
+            raise FolderError
         end
     end
 
-    def getImageFileName(image)
-        img_name = @Folder + "/" + image.url.to_s.split("/").last
+    def get_and_save_image(queue)
+        begin
+            image       = queue.pop
+            file_name   = @folder + "/" + image[:NAME]
 
-        if img_name.include?("?")
-            img_name.gsub!("?","_")
-            img_name << image.extname
-        end
-
-        return img_name
-    end
-
-    def getAndSaveImage(queue)
-        image = queue.pop
-        fileName = getImageFileName(image)
-
-        unless image.extname == ""
             Thread::exclusive {
-                unless File::exists?(fileName)
-                    @ImgList << fileName
-                    image.fetch.save(fileName)
+                unless File.exist?(file_name)
+                    image[:SRC].fetch.save(file_name)
+                    @img_cnt += 1
                 end
             }
+        rescue
+            raise SaveFileError
         end
-    end	
+    end
 
-    # картинки помещаются в очередь на загрузку
-    # затем @ThreadCnt потоков обрабатывают эту очередь
-
-    def queueLoad(page)
-        queueImages = Queue.new
-
-        page.images.each do |image|
-            queueImages << image
-        end
-
+    def thread_load(queue)
         threads = []
-        
-        @ThreadCnt.times do
-            threads << Thread.new { getAndSaveImage(queueImages) while not queueImages.empty? }
+        @thread_cnt.times do
+            threads << Thread.new {
+                while !queue.empty?
+                    get_and_save_image(queue)
+                end
+            }
         end
 
         threads.each { |thread| thread.join }
     end
+end
+
+class HTTPPageSocket
+
+    class ProxyError < StandardError
+    end
+
+    class URLError < StandardError
+    end
+
+    class GetPageError < StandardError
+    end
+
+    attr_reader :proxy, :user, :psw
+    attr_reader :url
+
+    def initialize(proxy = nil, user = nil, psw = nil)
+    
+        # proxy is string like 'server:8080'
+        
+        @proxy = proxy.gsub(" ","") unless proxy.nil?
+        @user, @psw = user, psw
+        
+        @agent = Mechanize.new do |a|
+            if @proxy
+                a.set_proxy(
+                    @proxy[%r{.*:}].sub(":",""),    # server
+                    @proxy[%r{[0-9]*$}],            # port
+                    @user, @psw
+                ) rescue raise ProxyError
+            end
+        end
+        
+    end
+
+    def open(url)
+        raise URLError if url.nil? || url.empty?
+        @url = url.gsub(" ","")
+        @agent.get(@url) rescue raise GetPageError
+    end
+
+end
+
+class HTTPPageParser
+
+    class GetImageError < StandardError
+    end
+
+    attr_reader :images
+    
+    def initialize
+        @images = Queue.new
+    end
+
+    # create queue from hash literal items [:SRC => Mechanize::Image, :NAME => File name]
+
+    def get_images(page)
+        @images.clear
+
+        begin
+            page.images.each do |image|
+                unless image.extname.empty?
+                    @images << { :SRC => image, :NAME => get_image_name(image) }
+                end
+            end
+        rescue
+            raise GetImageError
+        end
+
+        @images
+    end
+
+    private
+
+    def get_image_name(image)
+        image_name = image.url.to_s.split("/").last
+
+        if image_name.include?("?")
+            image_name.gsub!("?","_")
+            image_name << image.extname
+        end
+
+        image_name
+    end
+
 end

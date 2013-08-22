@@ -51,13 +51,9 @@ if ARGV.empty?
     puts opt_parser
 else
     begin
-        loader = ImageLoader.new do
-            self.Proxy      = options[:proxy]
-            self.User       = options[:user]
-            self.Password   = options[:psw]
-        end
+        loader = ImageLoader.new(options[:proxy],options[:user],options[:psw])
         loader.load(ARGV[0],ARGV[1])
-    rescue => err
-        puts err
+    rescue => ex
+        puts ex
     end
 end
